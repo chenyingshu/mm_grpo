@@ -33,6 +33,7 @@ actor_rollout_ref.rollout.mode="async"
 Left: Synchronous reward computing. Right: Asynchronous reward computing during rollout.
 </div>
 <br/>
+
 Reference: [ddpo-pytorch](https://github.com/kvablack/ddpo-pytorch/blob/main/scripts/train.py#L355).
 
 ## Usage
@@ -68,6 +69,7 @@ It involves appropriately partitioning resources, allocating dedicated resources
 Left: Synchronous training. Right: One-step-off asynchronous training
 </div>
 <br/>
+
 References:
 [verl Recipe: One Step Off Policy Async Trainer](https://github.com/volcengine/verl/tree/main/recipe/one_step_off_policy); <br/>
 [Asynchronous RLHF: Faster and More Efficient Off-Policy RL for Language Models](https://arxiv.org/abs/2410.18252)

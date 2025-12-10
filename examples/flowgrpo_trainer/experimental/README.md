@@ -14,7 +14,7 @@ GeRL provides a general framework for generative model RL post-training. By defa
 **Introduction:** Decouple actor and rollout into standalone resource pools, and use async rollout.
 
 ## Usage
-`hybrid_engine` is applied by default, i.e., coupled actor and rollout.<br>
+`hybrid_engine` is applied by default, i.e., coupled actor and rollout.<br/>
 To decouple actor and rollout into standalone resource pools, and use async rollout, set configs:
 ```bash
 actor_rollout_ref.hybrid_engine=False
@@ -27,8 +27,12 @@ actor_rollout_ref.rollout.mode="async"
 
 **Introduction:** During the rollout generation loop, after generating responses for each micro batch, asynchronously launch reward computation for the current batch. By combining asynchronous reward computing with rollout generation, rollout's GPU idle time is significantly reduced.
 
-<!-- TODO: add an illustration. -->
-
+<div align="center">
+<img width="1024" alt="with_reward" src="https://github.com/user-attachments/assets/430c3604-4af8-4e01-aabf-3ce2ac0648b0" />
+<br/>
+Left: Synchronous reward computing. Right: Asynchronous reward computing during rollout.
+</div>
+<br/>
 Reference: [ddpo-pytorch](https://github.com/kvablack/ddpo-pytorch/blob/main/scripts/train.py#L355).
 
 ## Usage
@@ -58,14 +62,14 @@ The following table shows the training throughput increase when using asynchrono
 We support the one-step-off async trainer to parallelize the generation and training processes, utilizing samples generated in the previous step for the current training.
 It involves appropriately partitioning resources, allocating dedicated resources for rollout generation and actor training. By reducing resources allocated to the generation phase, GPU idle time during long-tail sample generation is mitigated. Throughout this process, generation and training parameters maintain a one-step off policy.
 
-<center>
+<div align="center">
 <img src="https://raw.githubusercontent.com/eric-haibin-lin/verl-community/refs/heads/main/docs/one_step_off_policy.png" width=1024 />
-<br>
+<br/>
 Left: Synchronous training. Right: One-step-off asynchronous training
-</center>
-
+</div>
+<br/>
 References:
-[verl Recipe: One Step Off Policy Async Trainer](https://github.com/volcengine/verl/tree/main/recipe/one_step_off_policy); <br>
+[verl Recipe: One Step Off Policy Async Trainer](https://github.com/volcengine/verl/tree/main/recipe/one_step_off_policy); <br/>
 [Asynchronous RLHF: Faster and More Efficient Off-Policy RL for Language Models](https://arxiv.org/abs/2410.18252)
 
 ## Usage
@@ -95,6 +99,6 @@ actor_rollout_ref.async_strategy="one-step-off"
 
 - Validation reward curve：
 
-<center>
-<img width="800" alt="3p_comparison" src="https://github.com/user-attachments/assets/a9630a75-5cbf-48fe-996c-6c66a0b5f8be" />
-</center>
+<div align="center">
+<img width="600" alt="3p_comparison" src="https://github.com/user-attachments/assets/a9630a75-5cbf-48fe-996c-6c66a0b5f8be" />
+</div>

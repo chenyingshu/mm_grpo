@@ -191,6 +191,7 @@ class DiffusersSyncRollout(BaseRollout):
                     "responses": output.images,
                     "latents": output.all_latents,
                     "rollout_log_probs": output.all_log_probs,
+                    "rollout_preds": output.all_preds,
                     "timesteps": output.all_timesteps,
                     "prompt_embeds": output.prompt_embeds,
                     "pooled_prompt_embeds": output.pooled_prompt_embeds,

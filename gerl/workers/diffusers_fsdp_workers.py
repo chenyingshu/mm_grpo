@@ -907,6 +907,41 @@ class DiffusersActorRolloutRefWorker(Worker, DistProfilerExtension):
         output = output.to("cpu")
         return output
 
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @DistProfiler.annotate(color="blue", role="actor_compute_pred")
+    def compute_pred(self, data: DataProto):
+        assert self._is_actor
+
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+        # we should always recompute old_pred when it is HybridEngine
+        data.meta_info["micro_batch_size"] = (
+            self.config.rollout.log_prob_micro_batch_size_per_gpu
+        )
+        # perform recompute pred
+        # TODO: NFT applies lora, but double-check if should apply lora to infer
+        prediction = self.actor.compute_pred(data=data)
+        output = DataProto.from_dict(
+            tensors={
+                "old_preds": prediction,
+            }
+        )
+        output = output.to("cpu")
+
+        # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
+        # unshard the root FSDP module
+        if self.world_size > 1 and fsdp_version(self.actor.actor_module) == 1:
+            self.actor.actor_module._handle.reshard(True)
+
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            log_gpu_memory_usage(
+                "After offload model during compute_pred", logger=logger
+            )
+
+        return output
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self, local_path, global_step=0, max_ckpt_to_keep=None):
         # TODO (Mike): need to save the EMA model as well

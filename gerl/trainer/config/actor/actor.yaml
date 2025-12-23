@@ -32,14 +32,20 @@ clip_ratio: 0.0001
 # Maximum absolute value for advantage clipping
 clip_max: 5.0
 
+# DiffusionNFT advantage clipping mode: all(default), positive_only, negative_only, one_only, binary
+adv_mode: "all"
+
 # policy loss config
 policy_loss:
 
   # # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
   _target_: verl.workers.config.PolicyLossConfig
 
-  # Loss function mode: flow_grpo
+  # Loss function mode: flow_grpo, diffusion_nft
   loss_mode: "flow_grpo"
+
+  # DiffusionNFT beta for positive and negative prediction
+  nft_beta: 1.0
 
 # Whether to use KL loss instead of KL reward penalty. True for GRPO
 use_kl_loss: True

@@ -87,6 +87,7 @@ class AdvantageEstimator(str, Enum):
     """
 
     FLOW_GRPO = "flow_grpo"  # newly added for diffusion models
+    DIFFUSION_NFT = "diffusion_nft"  # newly added for diffusion models
 
 
 ADV_ESTIMATOR_REGISTRY: dict[str, Any] = {}
@@ -246,6 +247,106 @@ def compute_policy_loss_flow_grpo(
     policy_loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss))
 
     pg_metrics = {"actor/ppo_kl": policy_loss.detach().item()}
+    return policy_loss, pg_metrics
+
+
+@register_policy_loss("diffusion_nft")  # type: ignore[arg-type]
+def compute_policy_loss_diffusion_nft(
+    x0: torch.Tensor,
+    xt: torch.Tensor,
+    t_expanded: torch.Tensor,
+    old_prediction: torch.Tensor,
+    forward_prediction: torch.Tensor,
+    advantages: torch.Tensor,
+    config: DictConfig,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """
+    Compute the clipped policy objective and related metrics for FlowGRPO.
+
+    Adapted from
+    https://github.com/NVlabs/DiffusionNFT/blob/main/scripts/train_nft_sd3.py#L909
+
+    Args:
+        x0 (torch.Tensor):
+            Clean latent under the old policy, shape (batch_size,).
+        xt (torch.Tensor):
+            Noisy latent at timestep t, shape (batch_size,).
+        t_expanded (torch.Tensor):
+            Timestep t, shape (batch_size,).
+        old_prediction (torch.Tensor):
+            Noise prediction of actions under the old policy, shape (batch_size,).
+        forward_prediction (torch.Tensor):
+            Noise prediction of actions under the current policy, shape (batch_size,).
+        advantages (torch.Tensor):
+            Advantage estimates for each action, shape (batch_size,).
+        config: `(verl.trainer.config.ActorConfig)`:
+            config for the actor.
+    """
+    # clip advantages
+    advantages = torch.clamp(
+        advantages,
+        -config.clip_max,
+        config.clip_max,
+    )  # default adv_mode is "all"
+    if hasattr(config, "adv_mode"):
+        if config.adv_mode == "positive_only":
+            advantages = torch.clamp(advantages, 0, config.clip_max)
+        elif config.adv_mode == "negative_only":
+            advantages = torch.clamp(advantages, -config.clip_max, 0)
+        elif config.adv_mode == "one_only":
+            advantages = torch.where(
+                advantages > 0,
+                torch.ones_like(advantages),
+                torch.zeros_like(advantages),
+            )
+        elif config.adv_mode == "binary":
+            advantages = torch.sign(advantages)
+
+    # normalize advantage
+    normalized_advantages_clip = (advantages / config.clip_max) / 2.0 + 0.5
+    r = torch.clamp(normalized_advantages_clip, 0, 1)
+    positive_prediction = (
+        config.nft_beta * forward_prediction
+        + (1 - config.nft_beta) * old_prediction.detach()
+    )
+    implicit_negative_prediction = (
+        1.0 + config.nft_beta
+    ) * old_prediction.detach() - config.nft_beta * forward_prediction
+
+    # adaptive weighting
+    x0_prediction = xt - t_expanded * positive_prediction
+    with torch.no_grad():
+        weight_factor = (
+            torch.abs(x0_prediction.double() - x0.double())
+            .mean(dim=tuple(range(1, x0.ndim)), keepdim=True)
+            .clip(min=0.00001)
+        )
+    positive_loss = ((x0_prediction - x0) ** 2 / weight_factor).mean(
+        dim=tuple(range(1, x0.ndim))
+    )
+    negative_x0_prediction = xt - t_expanded * implicit_negative_prediction
+    with torch.no_grad():
+        negative_weight_factor = (
+            torch.abs(negative_x0_prediction.double() - x0.double())
+            .mean(dim=tuple(range(1, x0.ndim)), keepdim=True)
+            .clip(min=0.00001)
+        )
+    negative_loss = ((negative_x0_prediction - x0) ** 2 / negative_weight_factor).mean(
+        dim=tuple(range(1, x0.ndim))
+    )
+
+    ori_policy_loss = (
+        r * positive_loss / config.nft_beta
+        + (1.0 - r) * negative_loss / config.nft_beta
+    )
+    policy_loss = (ori_policy_loss * config.clip_max).mean()
+
+    # pg_metrics = {"actor/x0_norm": torch.mean(x0**2).detach().item()}
+    # pg_metrics = {"actor/x0_norm_max": torch.max(x0**2).detach().item()}
+    # pg_metrics = {"actor/old_deviate": torch.mean((forward_prediction - old_prediction) ** 2).detach().detach().item()}
+    # pg_metrics = {"actor/old_deviate_max": torch.max((forward_prediction - old_prediction) ** 2).detach().item()}
+    pg_metrics = {"actor/ppo_kl": policy_loss.detach().item()}
+    pg_metrics = {"actor/ppo_kl_unweighted": ori_policy_loss.mean().detach().item()}
     return policy_loss, pg_metrics
 
 

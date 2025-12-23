@@ -140,6 +140,9 @@ class RayDiffusionPPOTrainer:
         self.val_reward_fn = val_reward_fn
 
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
+        self.diffusion_nft = (
+            self.config.actor_rollout_ref.actor.policy_loss.loss_mode == "diffusion_nft"
+        )
 
         if self.hybrid_engine:
             assert Role.ActorRollout in role_worker_mapping, (
@@ -934,6 +937,8 @@ class RayDiffusionPPOTrainer:
 
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):
+                    # Sampling Part
+
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
                         if self.one_step_off_policy:
@@ -966,6 +971,7 @@ class RayDiffusionPPOTrainer:
                     )
                     batch = batch.union(gen_batch_output)
 
+                    # Reward Part
                     if not self.config.actor_rollout_ref.rollout.with_reward:
                         with marked_timer("reward", timing_raw, color="yellow"):
                             if self.use_rm and "rm_scores" not in batch.batch.keys():
@@ -980,6 +986,7 @@ class RayDiffusionPPOTrainer:
                                     batch, self.reward_fn
                                 )
 
+                    # Training Part
                     rollout_corr_config = self.config.algorithm.get(
                         "rollout_correction", None
                     )
@@ -987,22 +994,37 @@ class RayDiffusionPPOTrainer:
                         rollout_corr_config
                         and rollout_corr_config.get("bypass_mode", False)
                     )
-                    if bypass_recomputing_logprobs:
-                        batch.batch["old_log_probs"] = batch.batch["rollout_log_probs"]
-                    else:  # Recompute old_log_probs
-                        with marked_timer("old_log_prob", timing_raw, color="blue"):
-                            old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-                            batch = batch.union(old_log_prob)
+                    if self.diffusion_nft:
+                        # for NFT policy loss
+                        if bypass_recomputing_logprobs:
+                            batch.batch["old_preds"] = batch.batch["rollout_preds"]
+                        else:  # Recompute preds
+                            with marked_timer("old_preds", timing_raw, color="blue"):
+                                old_preds = self.actor_rollout_wg.compute_pred(batch)
+                                batch = batch.union(old_preds)
 
-                    assert "old_log_probs" in batch.batch, (
-                        f'"old_log_prob" not in {batch.batch.keys()=}'
-                    )
+                    else:  # apply flow-grpo by default
+                        if bypass_recomputing_logprobs:
+                            batch.batch["old_log_probs"] = batch.batch[
+                                "rollout_log_probs"
+                            ]
+                        else:  # Recompute old_log_probs
+                            with marked_timer("old_log_prob", timing_raw, color="blue"):
+                                old_log_prob = self.actor_rollout_wg.compute_log_prob(
+                                    batch
+                                )
+                                batch = batch.union(old_log_prob)
+
+                        assert "old_log_probs" in batch.batch, (
+                            f'"old_log_prob" not in {batch.batch.keys()=}'
+                        )
 
                     if self.use_reference_policy:
                         # compute reference log_prob
                         with marked_timer(
                             str(Role.RefPolicy), timing_raw, color="olive"
                         ):
+                            # TODO: apply diffusionNFT
                             if not self.ref_in_actor:
                                 ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(
                                     batch
@@ -1036,6 +1058,7 @@ class RayDiffusionPPOTrainer:
                                 "instance_level_scores"
                             ]
 
+                        # TODO: apply diffusionNFT
                         # compute advantages, executed on the driver process
                         norm_adv_by_std_in_grpo = self.config.algorithm.get(
                             "norm_adv_by_std_in_grpo", True
@@ -1063,6 +1086,8 @@ class RayDiffusionPPOTrainer:
                         self._log_rollout_data(
                             batch, reward_extra_infos_dict, timing_raw, rollout_data_dir
                         )
+
+                # Validation Part
 
                 # validate
                 if (

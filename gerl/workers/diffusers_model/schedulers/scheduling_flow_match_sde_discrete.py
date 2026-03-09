@@ -14,15 +14,14 @@
 # ============================================================================
 
 
-import math
 from dataclasses import dataclass
 from typing import Literal, Optional
 
 import torch
 from diffusers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils import BaseOutput
-from diffusers.utils.torch_utils import randn_tensor
 
+from ..solvers.solver import sample_previous_step_by_solver
 
 @dataclass
 class FlowMatchSDEDiscreteSchedulerOutput(BaseOutput):
@@ -57,6 +56,7 @@ class FlowMatchSDEDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
         noise_level: float = 0.7,
         prev_sample: Optional[torch.FloatTensor] = None,
         sde_type: Literal["sde", "cps"] = "sde",
+        rollout_solver: Literal["sde"] = "sde",
     ) -> FlowMatchSDEDiscreteSchedulerOutput | tuple:
         """
         Predict the sample from the previous timestep by reversing the SDE. This function propagates the diffusion
@@ -120,6 +120,7 @@ class FlowMatchSDEDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
             noise_level=noise_level,
             prev_sample=prev_sample,
             sde_type=sde_type,
+            rollout_solver=rollout_solver,
         )
 
         # upon completion increase step index by one
@@ -147,6 +148,7 @@ class FlowMatchSDEDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
         noise_level: float = 0.7,
         prev_sample: Optional[torch.Tensor] = None,
         sde_type: Literal["cps", "sde"] = "sde",
+        rollout_solver: Literal["sde"] = "sde",
     ):
         # check inputs
         assert sample.dtype == torch.float32
@@ -172,64 +174,28 @@ class FlowMatchSDEDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
                 )
 
             sigma_max = self.sigmas[1]
-            dt = sigma_next - sigma
 
-        if sde_type == "sde":
-            std_dev_t = (
-                torch.sqrt(sigma / (1 - torch.where(sigma == 1, sigma_max, sigma)))
-                * noise_level
-            )
+        # Step context for DPM2: match third-party DiffusionNFT step-order logic.
+        num_steps = len(self.sigmas) - 1
+        if torch.is_tensor(sigma_idx):
+            step_index_int = int(sigma_idx.flatten()[0].item())
+        else:
+            step_index_int = int(sigma_idx)
 
-            # our sde
-            prev_sample_mean = (
-                sample * (1 + std_dev_t**2 / (2 * sigma) * dt)
-                + model_output * (1 + std_dev_t**2 * (1 - sigma) / (2 * sigma)) * dt
-            )
+        solver_kwargs: dict = {
+            "rollout_solver": rollout_solver,
+            "sample": sample,
+            "model_output": model_output,
+            "sigma": sigma,
+            "sigma_next": sigma_next,
+            "sigma_max": sigma_max,
+            "noise_level": noise_level,
+            "prev_sample": prev_sample,
+            "sde_type": sde_type,
+            "generator": generator,
+        }
 
-            if prev_sample is None:
-                variance_noise = randn_tensor(
-                    model_output.shape,
-                    generator=generator,
-                    device=model_output.device,
-                    dtype=model_output.dtype,
-                )
-                prev_sample = (
-                    prev_sample_mean + std_dev_t * torch.sqrt(-1 * dt) * variance_noise
-                )
-
-            log_prob = (
-                -((prev_sample.detach() - prev_sample_mean) ** 2)
-                / (2 * ((std_dev_t * torch.sqrt(-1 * dt)) ** 2))
-                - torch.log(std_dev_t * torch.sqrt(-1 * dt))
-                - torch.log(torch.sqrt(2 * torch.as_tensor(math.pi)))
-            )
-
-        elif sde_type == "cps":
-            std_dev_t = sigma_next * math.sin(
-                noise_level * math.pi / 2
-            )  # sigma_t in paper
-            pred_original_sample = (
-                sample - sigma * model_output
-            )  # predicted x_0 in paper
-            noise_estimate = sample + model_output * (
-                1 - sigma
-            )  # predicted x_1 in paper
-            prev_sample_mean = pred_original_sample * (
-                1 - sigma_next
-            ) + noise_estimate * torch.sqrt(sigma_next**2 - std_dev_t**2)
-
-            if prev_sample is None:
-                variance_noise = randn_tensor(
-                    model_output.shape,
-                    generator=generator,
-                    device=model_output.device,
-                    dtype=model_output.dtype,
-                )
-                prev_sample = prev_sample_mean + std_dev_t * variance_noise
-
-            # remove all constants
-            log_prob = -((prev_sample.detach() - prev_sample_mean) ** 2)
-
-        # mean along all but batch dimension
-        log_prob = log_prob.mean(dim=tuple(range(1, log_prob.ndim)))
+        prev_sample, log_prob, prev_sample_mean, std_dev_t = sample_previous_step_by_solver(
+            **solver_kwargs,
+        )
         return prev_sample, log_prob, prev_sample_mean, std_dev_t

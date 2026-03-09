@@ -49,7 +49,8 @@ class StableDiffusion3PipelineWithLogProbOutput(BaseOutput):
 
     images: list[PIL.Image.Image] | np.ndarray | torch.FloatTensor
     all_latents: list[torch.FloatTensor]
-    all_log_probs: list[torch.FloatTensor]
+    all_log_probs: list[torch.FloatTensor]  # FlowGRPO use
+    all_preds: torch.FloatTensor  # DiffusionNFT use (stacked noise preds per step)
     all_timesteps: list[int]
     prompt_embeds: torch.FloatTensor
     pooled_prompt_embeds: torch.FloatTensor
@@ -97,6 +98,7 @@ class StableDiffusion3PipelineWithLogProb(StableDiffusion3Pipeline):
         sde_window_size: Optional[int] = None,
         sde_window_range: tuple[int, int] = (0, 5),
         sde_type: Literal["sde", "cps"] = "sde",
+        rollout_solver: Literal["sde"] = "sde", # DiffusionNFT use
     ):
         """
         Function invoked when calling the pipeline for generation.
@@ -259,6 +261,7 @@ class StableDiffusion3PipelineWithLogProb(StableDiffusion3Pipeline):
         # 7. Denoising loop
         all_latents = []
         all_log_probs = []
+        all_preds = []
         all_timesteps = []
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
@@ -331,6 +334,7 @@ class StableDiffusion3PipelineWithLogProb(StableDiffusion3Pipeline):
                     generator=generator,
                     noise_level=cur_noise_level,
                     sde_type=sde_type,
+                    rollout_solver=rollout_solver,
                     return_dict=False,
                 )
 
@@ -354,6 +358,7 @@ class StableDiffusion3PipelineWithLogProb(StableDiffusion3Pipeline):
                 if i >= sde_window[0] and i < sde_window[1]:
                     all_latents.append(latents)
                     all_log_probs.append(log_prob)
+                    all_preds.append(noise_pred)
                     all_timesteps.append(t)
 
                 # call the callback, if provided
@@ -381,6 +386,7 @@ class StableDiffusion3PipelineWithLogProb(StableDiffusion3Pipeline):
 
         all_latents = torch.stack(all_latents, dim=1)
         all_log_probs = torch.stack(all_log_probs, dim=1)
+        all_preds = torch.stack(all_preds, dim=1)
         all_timesteps = torch.stack(all_timesteps).unsqueeze(0).expand(batch_size, -1)
         if self.do_classifier_free_guidance:
             prompt_embeds = prompt_embeds[batch_size:]
@@ -391,6 +397,7 @@ class StableDiffusion3PipelineWithLogProb(StableDiffusion3Pipeline):
                 image,
                 all_latents,
                 all_log_probs,
+                all_preds,
                 all_timesteps,
                 prompt_embeds,
                 pooled_prompt_embeds,
@@ -402,6 +409,7 @@ class StableDiffusion3PipelineWithLogProb(StableDiffusion3Pipeline):
             images=image,
             all_latents=all_latents,
             all_log_probs=all_log_probs,
+            all_preds=all_preds,
             all_timesteps=all_timesteps,
             prompt_embeds=prompt_embeds,
             pooled_prompt_embeds=pooled_prompt_embeds,

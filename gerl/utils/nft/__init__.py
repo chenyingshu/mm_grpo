@@ -1,5 +1,3 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
-#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -13,6 +11,6 @@
 # limitations under the License.
 # ============================================================================
 
-from .lora import select_lora_modules
+from .utils import nft_update_old_adapter, return_decay
 
-__all__ = ["select_lora_modules", "collect_lora_params_for_adapter"]
+__all__ = ["nft_update_old_adapter", "return_decay"]

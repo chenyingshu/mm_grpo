@@ -184,6 +184,7 @@ class DiffusersSyncRollout(BaseRollout):
                 sde_window_size=self.config.sde_window_size,
                 sde_window_range=self.config.sde_window_range,
                 sde_type=self.config.sde_type,
+                rollout_solver=self.config.rollout_solver,
             )
 
             result = TensorDict(
@@ -191,6 +192,7 @@ class DiffusersSyncRollout(BaseRollout):
                     "responses": output.images,
                     "latents": output.all_latents,
                     "rollout_log_probs": output.all_log_probs,
+                    "old_preds": output.all_preds,
                     "timesteps": output.all_timesteps,
                     "prompt_embeds": output.prompt_embeds,
                     "pooled_prompt_embeds": output.pooled_prompt_embeds,

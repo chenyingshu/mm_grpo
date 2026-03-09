@@ -36,9 +36,13 @@ class PolicyLossConfig(BaseConfig):
 
     Args:
         loss_mode (str): Loss function mode. Options: 'flow_grpo'
+        nft_beta (float): DiffusionNFT beta for positive/negative prediction. Used when loss_mode=diffusion_nft.
+        nft_decay_type (int): DiffusionNFT old-adapter EMA decay type (0=no decay, 1=uprate 0.001 uphold 0.5, 2=flat 75 uprate 0.0075 uphold 0.999).
     """
 
     loss_mode: str = "flow_grpo"
+    nft_beta: float = 1.0
+    nft_decay_type: int = 2
 
 
 @dataclass
@@ -78,6 +82,7 @@ class DiffusionActorConfig(BaseConfig):
     shuffle_micro_batch: bool = False
     clip_ratio: float = 1e-4
     clip_max: float = 5.0
+    adv_mode: str = "all"
     policy_loss: PolicyLossConfig = field(default_factory=PolicyLossConfig)
     use_kl_loss: bool = True
     kl_loss_coef: float = 0.04
@@ -91,6 +96,7 @@ class DiffusionActorConfig(BaseConfig):
     guidance_scale: float = 4.5
     noise_level: float = 0.7
     sde_type: Literal["sde", "cps"] = "sde"
+    rollout_solver: Literal["sde"] = "sde"
     num_inference_steps: int = 10
 
     def __post_init__(self):

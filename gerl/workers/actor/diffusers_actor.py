@@ -33,7 +33,7 @@ from verl.utils.torch_dtypes import PrecisionType
 from verl.workers.actor import BasePPOActor
 
 from ...protocol import DataProto
-from ...trainer.ppo.core_algos import get_policy_loss_fn, kl_penalty
+from ...trainer.ppo.core_algos import get_kl_loss_fn, get_policy_loss_fn
 from ...utils.ema import EMAModuleWrapper
 from ..config import DiffusionFSDPActorConfig
 
@@ -86,6 +86,48 @@ class DiffusersPPOActor(BasePPOActor):
             self.scaler = ShardedGradScaler(growth_interval=400, init_scale=2**24)
         else:
             self.scaler = None
+
+    def _predict_micro_batch(
+            self, micro_batch: dict[str, torch.Tensor], step: int
+    ) -> torch.Tensor:
+        """
+        Returns:
+            noise_pred: single step noise predction, shape (bs, )
+        """
+
+        latents = micro_batch["latents"]
+        timesteps = micro_batch["timesteps"]
+        prompt_embeds = micro_batch["prompt_embeds"]
+        pooled_prompt_embeds = micro_batch["pooled_prompt_embeds"]
+        negative_prompt_embeds = micro_batch["negative_prompt_embeds"]
+        negative_pooled_prompt_embeds = micro_batch["negative_pooled_prompt_embeds"]
+
+        if self.config.guidance_scale > 1.0:
+            noise_pred = self.actor_module(
+                hidden_states=torch.cat([latents[:, step]] * 2),
+                timestep=torch.cat([timesteps[:, step]] * 2),
+                encoder_hidden_states=torch.cat(
+                    [negative_prompt_embeds, prompt_embeds], dim=0
+                ),
+                pooled_projections=torch.cat(
+                    [negative_pooled_prompt_embeds, pooled_prompt_embeds], dim=0
+                ),
+                return_dict=False,
+            )[0]
+            noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+            noise_pred = noise_pred_uncond + self.config.guidance_scale * (
+                    noise_pred_text - noise_pred_uncond
+            )
+        else:
+            noise_pred = self.actor_module(
+                hidden_states=latents[:, step],
+                timestep=timesteps[:, step],
+                encoder_hidden_states=prompt_embeds,
+                pooled_projections=pooled_prompt_embeds,
+                return_dict=False,
+            )[0]
+
+        return noise_pred
 
     def _forward_micro_batch(
         self, micro_batch: dict[str, torch.Tensor], step: int
@@ -216,16 +258,53 @@ class DiffusersPPOActor(BasePPOActor):
 
         return log_probs, prev_sample_mean
 
+    def _compute_nft_old_and_forward_on_same_xt(
+        self,
+        model_inputs: dict[str, torch.Tensor],
+        step: int,
+        compute_ref: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        peft_model = getattr(
+            self.actor_module, "_fsdp_wrapped_module", self.actor_module
+        )
+        assert (
+            hasattr(peft_model, "peft_config")
+            and "old" in getattr(peft_model, "peft_config", {})
+        ), "DiffusionNFT old adapter is missing. Expected adapter 'old' for same-xt old prediction."
+
+        peft_model.set_adapter("old")
+        try:
+            with torch.no_grad():
+                old_prediction = self._predict_micro_batch(model_inputs, step=step)
+        finally:
+            peft_model.set_adapter("default")
+
+        forward_prediction = self._predict_micro_batch(model_inputs, step=step)
+
+        ref_prediction: Optional[torch.Tensor] = None
+        if compute_ref:
+            peft_model.disable_adapters()
+            try:
+                with torch.no_grad():
+                    ref_prediction = self._predict_micro_batch(model_inputs, step=step)
+            finally:
+                peft_model.enable_adapters()
+
+        return old_prediction, forward_prediction, ref_prediction
+
     @GPUMemoryLogger(role="diffusers actor", logger=logger)
     def update_policy(self, data: DataProto):
         assert self.actor_optimizer is not None
+
+        loss_mode = getattr(
+            self.config.policy_loss, "loss_mode", "flow_grpo"
+        )
 
         # make sure we are in training mode
         self.actor_module.train()
 
         select_keys = [
             "latents",
-            "old_log_probs",
             "advantages",
             "timesteps",
             "prompt_embeds",
@@ -233,7 +312,9 @@ class DiffusersPPOActor(BasePPOActor):
             "negative_prompt_embeds",
             "negative_pooled_prompt_embeds",
         ]
-        if self.config.use_kl_loss:
+        if loss_mode == "flow_grpo":
+            select_keys.append("old_log_probs")
+        if self.config.use_kl_loss and loss_mode != "diffusion_nft":
             select_keys.append("ref_prev_sample_mean")
 
         data = data.select(batch_keys=select_keys)
@@ -267,44 +348,78 @@ class DiffusersPPOActor(BasePPOActor):
                             **micro_batch.batch,
                             **micro_batch.non_tensor_batch,
                         }
-                        old_log_prob = model_inputs["old_log_probs"]
                         advantages = model_inputs["advantages"]
 
                         loss_scale_factor = 1 / self.gradient_accumulation
-
-                        log_prob, prev_sample_mean, std_dev_t = (
-                            self._forward_micro_batch(model_inputs, step=step)
-                        )
-
-                        loss_mode = self.config.policy_loss.get(
-                            "loss_mode", "flow_grpo"
-                        )
-
                         policy_loss_fn = get_policy_loss_fn(loss_mode)
 
                         # Compute policy loss (any function is expected to return 2 values)
-                        pg_loss, pg_metrics = policy_loss_fn(
-                            old_log_prob=old_log_prob[:, step],
-                            log_prob=log_prob,
-                            advantages=advantages,
-                            config=self.config,
-                        )
+                        if loss_mode == "flow_grpo":
+                            old_log_prob = model_inputs["old_log_probs"]
+                            log_prob, prev_sample_mean, std_dev_t = (
+                                self._forward_micro_batch(model_inputs, step=step)
+                            )
+
+                            pg_loss, pg_metrics = policy_loss_fn(
+                                old_log_prob=old_log_prob[:, step],
+                                log_prob=log_prob,
+                                advantages=advantages,
+                                config=self.config,
+                            )
+                        elif loss_mode == "diffusion_nft":
+                            x0 = model_inputs["latents"][:, -1]
+                            t = model_inputs["timesteps"][:, step] / 1000.0
+                            t_expanded = t.view(-1, *([1] * (len(x0.shape) - 1)))
+                            noise = torch.randn_like(x0.float())
+                            xt = (1 - t_expanded) * x0 + t_expanded * noise
+                            model_inputs["latents"][:, step] = xt
+                            old_prediction, forward_prediction, ref_prediction = (
+                                self._compute_nft_old_and_forward_on_same_xt(
+                                    model_inputs=model_inputs,
+                                    step=step,
+                                    compute_ref=self.config.use_kl_loss,
+                                )
+                            )
+
+                            pg_loss, pg_metrics = policy_loss_fn(
+                                x0=x0,
+                                xt=xt,
+                                t_expanded=t_expanded,
+                                old_prediction=old_prediction,
+                                forward_prediction=forward_prediction,
+                                advantages=advantages,
+                                config=self.config,
+                            )
+                        else:
+                            raise ValueError(f"Unknown loss mode: {loss_mode}")
                         micro_batch_metrics.update(pg_metrics)
 
                         policy_loss = pg_loss
 
                         if self.config.use_kl_loss:
-                            ref_prev_sample_mean = model_inputs["ref_prev_sample_mean"]
-                            ref_prev_sample_mean = ref_prev_sample_mean[:, step]
-                            # compute kl loss
-                            kld = kl_penalty(
-                                prev_sample_mean, ref_prev_sample_mean, std_dev_t
-                            )
-                            kl_loss = kld.mean()
+                            kl_fn = get_kl_loss_fn(loss_mode)
+                            if loss_mode == "flow_grpo":
+                                kl_loss, kl_metrics = kl_fn(
+                                    prev_sample_mean=prev_sample_mean,
+                                    ref_prev_sample_mean=model_inputs[
+                                        "ref_prev_sample_mean"
+                                    ][:, step],
+                                    std_dev_t=std_dev_t,
+                                )
+                            elif loss_mode == "diffusion_nft":
+                                kl_loss, kl_metrics = kl_fn(
+                                    forward_prediction=forward_prediction,
+                                    ref_prediction=ref_prediction,
+                                )
+                            else:
+                                raise ValueError(
+                                    f"No KL loss registered for: {loss_mode}"
+                                )
 
                             policy_loss = (
                                 policy_loss + kl_loss * self.config.kl_loss_coef
                             )
+                            micro_batch_metrics.update(kl_metrics)
                             micro_batch_metrics["actor/kl_loss"] = (
                                 kl_loss.detach().item() * loss_scale_factor
                             )

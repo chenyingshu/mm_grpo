@@ -42,6 +42,9 @@ guidance_scale: 4.5
 # SDE type during rollout
 sde_type: "sde"
 
+# Rollout solver type: sde
+rollout_solver: "sde"
+
 # SDE window size
 sde_window_size: null
 

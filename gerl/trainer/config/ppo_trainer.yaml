@@ -70,7 +70,7 @@ algorithm:
   # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
   _target_: gerl.trainer.config.AlgoConfig
 
-  # Advantage estimator type: "gae", "grpo", "reinforce_plus_plus", etc.
+  # Advantage estimator type: "flow_grpo", etc.
   adv_estimator: flow_grpo
 
   # Whether to normalize advantages by std (specific to GRPO)

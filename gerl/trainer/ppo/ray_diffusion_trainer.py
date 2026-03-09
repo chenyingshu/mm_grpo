@@ -166,6 +166,15 @@ class RayDiffusionPPOTrainer:
             or config.actor_rollout_ref.model.get("lora_adapter_path") is not None
         )
 
+        self.diffusion_nft = (
+            OmegaConf.select(
+                config,
+                "actor_rollout_ref.actor.policy_loss.loss_mode",
+                default="flow_grpo",
+            )
+            == "diffusion_nft"
+        )
+
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
     def _create_dataloader(
@@ -965,6 +974,7 @@ class RayDiffusionPPOTrainer:
                         interleave=True,
                     )
                     batch = batch.union(gen_batch_output)
+                    reward_extra_infos_dict: dict = {}
 
                     if not self.config.actor_rollout_ref.rollout.with_reward:
                         with marked_timer("reward", timing_raw, color="yellow"):
@@ -987,19 +997,25 @@ class RayDiffusionPPOTrainer:
                         rollout_corr_config
                         and rollout_corr_config.get("bypass_mode", False)
                     )
-                    if bypass_recomputing_logprobs:
-                        batch.batch["old_log_probs"] = batch.batch["rollout_log_probs"]
-                    else:  # Recompute old_log_probs
-                        with marked_timer("old_log_prob", timing_raw, color="blue"):
-                            old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-                            batch = batch.union(old_log_prob)
+                    if not self.diffusion_nft:
+                        # FlowGRPO: use old_log_probs
+                        if bypass_recomputing_logprobs:
+                            batch.batch["old_log_probs"] = batch.batch[
+                                "rollout_log_probs"
+                            ]
+                        else:
+                            with marked_timer("old_log_prob", timing_raw, color="blue"):
+                                old_log_prob = self.actor_rollout_wg.compute_log_prob(
+                                    batch
+                                )
+                                batch = batch.union(old_log_prob)
+                        assert "old_log_probs" in batch.batch, (
+                            f'"old_log_prob" not in {batch.batch.keys()=}'
+                        )
 
-                    assert "old_log_probs" in batch.batch, (
-                        f'"old_log_prob" not in {batch.batch.keys()=}'
-                    )
-
-                    if self.use_reference_policy:
-                        # compute reference log_prob
+                    if self.use_reference_policy and not self.diffusion_nft:
+                        # compute reference log_prob (NFT computes ref
+                        # prediction inline during update_policy instead)
                         with marked_timer(
                             str(Role.RefPolicy), timing_raw, color="olive"
                         ):
@@ -1157,6 +1173,11 @@ class RayDiffusionPPOTrainer:
                     )
 
                 if is_last_step:
+                    # DiffusionNFT: final epoch-boundary old adapter update
+                    if self.diffusion_nft:
+                        self.actor_rollout_wg.update_old_adapter(
+                            self.global_steps
+                        )
                     pprint(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.close()
                     return
@@ -1166,3 +1187,7 @@ class RayDiffusionPPOTrainer:
                 if hasattr(self.train_dataset, "on_batch_end"):
                     # The dataset may be changed after each training batch
                     self.train_dataset.on_batch_end(batch=batch)
+
+            # DiffusionNFT: adaptive weight decay - update old adapter at epoch boundary
+            if self.diffusion_nft:
+                self.actor_rollout_wg.update_old_adapter(self.global_steps)

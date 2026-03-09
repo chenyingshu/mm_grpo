@@ -46,6 +46,7 @@ class DiffusionRolloutConfig(BaseConfig):
     noise_level: float = 0.7
     guidance_scale: float = 4.5
     sde_type: Literal["sde", "cps"] = "sde"
+    rollout_solver: Literal["sde"] = "sde"
     sde_window_size: Optional[int] = None
     sde_window_range: Optional[tuple[int, int]] = None
 

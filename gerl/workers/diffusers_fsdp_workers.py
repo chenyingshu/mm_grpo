@@ -53,7 +53,6 @@ from verl.utils.fsdp_utils import (
     CPUOffloadPolicy,
     MixedPrecisionPolicy,
     apply_fsdp2,
-    collect_lora_params,
     fsdp2_load_full_state_dict,
     fsdp_version,
     get_fsdp_wrap_policy,
@@ -66,6 +65,7 @@ from verl.utils.fsdp_utils import (
     offload_fsdp_model_to_cpu,
     offload_fsdp_optimizer,
 )
+
 from verl.utils.import_utils import import_external_libs
 from verl.utils.profiler import (
     DistProfiler,
@@ -85,7 +85,8 @@ from verl.workers.fsdp_workers import create_device_mesh, get_sharding_strategy
 
 from ..protocol import DataProto
 from ..utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
-from ..utils.lora import select_lora_modules
+from ..utils.nft import nft_update_old_adapter
+from ..utils.lora import collect_lora_params_for_adapter, select_lora_modules
 from .config import (
     DiffusersModelConfig,
     DiffusionRolloutConfig,
@@ -158,6 +159,12 @@ class DiffusersActorRolloutRefWorker(Worker, DistProfilerExtension):
         self._is_ref = self.role in ["ref", "actor_rollout_ref"]
         self.use_orig_params = self.config.actor.fsdp_config.get(
             "use_orig_params", False
+        )
+        self._use_diffusion_nft = (
+            OmegaConf.select(
+                self.config, "actor.policy_loss.loss_mode", default="flow_grpo"
+            )
+            == "diffusion_nft"
         )
 
         # TODO(haibin.lin):
@@ -330,6 +337,32 @@ class DiffusersActorRolloutRefWorker(Worker, DistProfilerExtension):
                         "bias": "none",
                     }
                     actor_module.add_adapter(LoraConfig(**lora_config))
+
+                # DiffusionNFT: add "old" adapter for rollout policy (dual adapter)
+                if self._use_diffusion_nft and role == "actor" and self._is_actor:
+                    from peft import LoraConfig
+
+                    lora_config_for_old = actor_module.peft_config["default"]
+                    if isinstance(lora_config_for_old, dict):
+                        lora_config_for_old = LoraConfig(**lora_config_for_old)
+                    actor_module.add_adapter(lora_config_for_old, "old")
+                    # Initial copy: default -> old
+                    actor_module.set_adapter("default")
+                    default_params = list(
+                        filter(lambda p: p.requires_grad, actor_module.parameters())
+                    )
+                    actor_module.set_adapter("old")
+                    old_params = list(
+                        filter(lambda p: p.requires_grad, actor_module.parameters())
+                    )
+                    actor_module.set_adapter("default")
+                    with torch.no_grad():
+                        for src_param, tgt_param in zip(default_params, old_params):
+                            tgt_param.data.copy_(src_param.detach().data)
+                    if self.rank == 0:
+                        logger.info(
+                            "DiffusionNFT: added 'old' LoRA adapter, copied default->old"
+                        )
 
         torch.distributed.barrier()
 
@@ -582,13 +615,27 @@ class DiffusersActorRolloutRefWorker(Worker, DistProfilerExtension):
         peft_model = getattr(
             self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp
         )
+        use_old_adapter = (
+            self._use_diffusion_nft
+            and hasattr(peft_model, "peft_config")
+            and "old" in getattr(peft_model, "peft_config", {})
+        )
         if hasattr(peft_model, "peft_config"):  # LoRA
             peft_config = peft_model.peft_config.get("default", None)
-            params = collect_lora_params(
-                module=self.actor_module_fsdp,
-                layered_summon=self.config.rollout.get("layered_summon", False),
-                base_sync_done=self.base_sync_done,
-            )
+            if use_old_adapter:
+                params = collect_lora_params_for_adapter(
+                    module=self.actor_module_fsdp,
+                    adapter_name="old",
+                    layered_summon=self.config.rollout.get("layered_summon", False),
+                    base_sync_done=self.base_sync_done,
+                )
+            else:
+                params = collect_lora_params_for_adapter(
+                    module=self.actor_module_fsdp,
+                    adapter_name="default",
+                    layered_summon=self.config.rollout.get("layered_summon", False),
+                    base_sync_done=self.base_sync_done,
+                )
         else:
             params = self.actor_module_fsdp.state_dict()
 
@@ -794,6 +841,28 @@ class DiffusersActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         return output
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def update_old_adapter(self, global_step: int):
+        """DiffusionNFT: adapative weight decay update old adapter after policy update."""
+        if not self._is_actor or not self._use_diffusion_nft:
+            return
+        peft_model = getattr(
+            self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp
+        )
+        if not (
+            hasattr(peft_model, "peft_config")
+            and "old" in getattr(peft_model, "peft_config", {})
+        ):
+            return
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+        decay_type = OmegaConf.select(
+            self.config, "actor.policy_loss.nft_decay_type", default=2
+        )
+        nft_update_old_adapter(peft_model, global_step, decay_type=int(decay_type))
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
     @DistProfiler.annotate(color="red", role="rollout_generate")
     def generate_sequences(self, prompts: DataProto):
@@ -930,19 +999,36 @@ class DiffusersActorRolloutRefWorker(Worker, DistProfilerExtension):
             getattr(self, "actor_module", self.actor_module_fsdp), "peft_config"
         ):
             lora_save_path = os.path.join(local_path, "lora_adapter")
+            lora_save_path_old = os.path.join(local_path, "lora_adapter_old")
             peft_model = getattr(self, "actor_module", self.actor_module_fsdp)
             peft_config = {}
+            peft_config_old = {}
             if torch.distributed.get_rank() == 0:
                 os.makedirs(lora_save_path, exist_ok=True)
+                os.makedirs(lora_save_path_old, exist_ok=True)
                 peft_config = asdict(peft_model.peft_config.get("default", {}))
                 peft_config["peft_type"] = peft_config["peft_type"].value
                 peft_config["target_modules"] = list(peft_config["target_modules"])
+                if "old" in peft_model.peft_config:
+                    peft_config_old = asdict(peft_model.peft_config.get("old", {}))
+                    peft_config_old["peft_type"] = peft_config_old["peft_type"].value
+                    peft_config_old["target_modules"] = list(
+                        peft_config_old["target_modules"]
+                    )
             try:
                 if fsdp_version(self.actor_module_fsdp) > 0:
                     self.actor_module_fsdp = self.actor_module_fsdp.to(
                         get_device_name()
                     )
                     lora_params = layered_summon_lora_params(self.actor_module_fsdp)
+                    lora_params_old = None
+                    if "old" in getattr(peft_model, "peft_config", {}):
+                        lora_params_old = collect_lora_params_for_adapter(
+                            module=self.actor_module_fsdp,
+                            adapter_name="old",
+                            layered_summon=False,
+                            base_sync_done=True,
+                        )
                     if torch.distributed.get_rank() == 0:
                         save_file(
                             lora_params,
@@ -954,6 +1040,21 @@ class DiffusersActorRolloutRefWorker(Worker, DistProfilerExtension):
                             encoding="utf-8",
                         ) as f:
                             json.dump(peft_config, f, ensure_ascii=False, indent=4)
+                        if lora_params_old is not None:
+                            save_file(
+                                lora_params_old,
+                                os.path.join(
+                                    lora_save_path_old, "adapter_model.safetensors"
+                                ),
+                            )
+                            with open(
+                                os.path.join(lora_save_path_old, "adapter_config.json"),
+                                "w",
+                                encoding="utf-8",
+                            ) as f:
+                                json.dump(
+                                    peft_config_old, f, ensure_ascii=False, indent=4
+                                )
             except Exception as e:
                 log_with_rank(
                     f"Save LoRA Adapter Error ({e})",
@@ -995,6 +1096,31 @@ class DiffusersActorRolloutRefWorker(Worker, DistProfilerExtension):
             local_path=local_path,
             del_local_after_load=del_local_after_load,
         )
+
+        # DiffusionNFT dual-adapter usage, ensure shape remains valid after resume.
+        if self._use_diffusion_nft and self._is_lora:
+            peft_model = getattr(
+                self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp
+            )
+            if hasattr(peft_model, "peft_config") and "old" not in peft_model.peft_config:
+                from peft import LoraConfig
+
+                lora_config_for_old = peft_model.peft_config.get("default")
+                if isinstance(lora_config_for_old, dict):
+                    lora_config_for_old = LoraConfig(**lora_config_for_old)
+                peft_model.add_adapter(lora_config_for_old, "old")
+                peft_model.set_adapter("default")
+                default_params = list(
+                    filter(lambda p: p.requires_grad, peft_model.parameters())
+                )
+                peft_model.set_adapter("old")
+                old_params = list(
+                    filter(lambda p: p.requires_grad, peft_model.parameters())
+                )
+                peft_model.set_adapter("default")
+                with torch.no_grad():
+                    for src_param, tgt_param in zip(default_params, old_params):
+                        tgt_param.data.copy_(src_param.detach().data)
 
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
@@ -1048,13 +1174,27 @@ class AsyncDiffusersActorRolloutRefWorker(DiffusersActorRolloutRefWorker):
         peft_model = getattr(
             self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp
         )
+        use_old_adapter = (
+            self._use_diffusion_nft
+            and hasattr(peft_model, "peft_config")
+            and "old" in getattr(peft_model, "peft_config", {})
+        )
         if hasattr(peft_model, "peft_config"):  # LoRA
             peft_config = peft_model.peft_config.get("default", None)
-            params = collect_lora_params(
-                module=self.actor_module_fsdp,
-                layered_summon=self.config.rollout.get("layered_summon", False),
-                base_sync_done=base_sync_done,
-            )
+            if use_old_adapter:
+                params = collect_lora_params_for_adapter(
+                    module=self.actor_module_fsdp,
+                    adapter_name="old",
+                    layered_summon=self.config.rollout.get("layered_summon", False),
+                    base_sync_done=base_sync_done,
+                )
+            else:
+                params = collect_lora_params_for_adapter(
+                    module=self.actor_module_fsdp,
+                    adapter_name="default",
+                    layered_summon=self.config.rollout.get("layered_summon", False),
+                    base_sync_done=base_sync_done,
+                )
         else:
             params = self.actor_module_fsdp.state_dict()
 

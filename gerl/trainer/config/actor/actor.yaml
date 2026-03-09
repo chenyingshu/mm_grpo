@@ -35,11 +35,17 @@ clip_max: 5.0
 # policy loss config
 policy_loss:
 
-  # # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
-  _target_: verl.workers.config.PolicyLossConfig
+  # # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs (gerl adds nft_beta/nft_decay_type for DiffusionNFT)
+  _target_: gerl.workers.config.actor.PolicyLossConfig
 
-  # Loss function mode: flow_grpo
+  # Loss function mode: flow_grpo or diffusion_nft
   loss_mode: "flow_grpo"
+
+  # DiffusionNFT beta for positive and negative prediction
+  nft_beta: 1.0
+
+  # DiffusionNFT old adapter decay type: 0=no decay, 1=uprate 0.001 uphold 0.5, 2=flat 75 uprate 0.0075 uphold 0.999
+  nft_decay_type: 2
 
 # Whether to use KL loss instead of KL reward penalty. True for GRPO
 use_kl_loss: True
@@ -61,6 +67,9 @@ noise_level: ${actor_rollout_ref.rollout.noise_level}
 
 # SDE type during training
 sde_type: ${actor_rollout_ref.rollout.sde_type}
+
+# Rollout solver used for train-time compute
+rollout_solver: ${actor_rollout_ref.rollout.rollout_solver}
 
 # Number of inference steps, same as rollout
 num_inference_steps: ${oc.select:actor_rollout_ref.rollout.num_inference_steps,10}

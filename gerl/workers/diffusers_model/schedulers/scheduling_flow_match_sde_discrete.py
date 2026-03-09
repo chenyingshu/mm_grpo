@@ -175,13 +175,6 @@ class FlowMatchSDEDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
 
             sigma_max = self.sigmas[1]
 
-        # Step context for DPM2: match third-party DiffusionNFT step-order logic.
-        num_steps = len(self.sigmas) - 1
-        if torch.is_tensor(sigma_idx):
-            step_index_int = int(sigma_idx.flatten()[0].item())
-        else:
-            step_index_int = int(sigma_idx)
-
         solver_kwargs: dict = {
             "rollout_solver": rollout_solver,
             "sample": sample,

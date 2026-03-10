@@ -39,6 +39,7 @@ class PaddleOCRScorer(Scorer):
             lang="en",
             ocr_version="PP-OCRv4",
             device="cpu",
+            enable_mkldnn=False,
         )
 
     @torch.no_grad()

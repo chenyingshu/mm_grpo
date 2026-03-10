@@ -47,6 +47,8 @@ PolicyLossFn = Callable[
 
 POLICY_LOSS_REGISTRY: dict[str, PolicyLossFn] = {}
 
+KlLossFn = Callable[..., tuple[torch.Tensor, dict[str, Any]]]
+
 KL_LOSS_REGISTRY: dict[str, KlLossFn] = {}
 
 def register_kl_loss(name: str) -> Callable[[KlLossFn], KlLossFn]:
@@ -57,7 +59,7 @@ def register_kl_loss(name: str) -> Callable[[KlLossFn], KlLossFn]:
         function: Decorator function that registers the KL loss function.
     """
 
-    def decorator(func: KlLossFn) -> KlLoffFn:
+    def decorator(func: KlLossFn) -> KlLossFn:
         KL_LOSS_REGISTRY[name] = func
         return func
 

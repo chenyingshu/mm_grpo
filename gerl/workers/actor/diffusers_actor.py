@@ -92,7 +92,7 @@ class DiffusersPPOActor(BasePPOActor):
     ) -> torch.Tensor:
         """
         Returns:
-            noise_pred: single step noise predction, shape (bs, )
+            noise_pred: single step noise prediction, shape (bs, )
         """
 
         latents = micro_batch["latents"]

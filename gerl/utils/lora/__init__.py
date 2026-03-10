@@ -14,5 +14,6 @@
 # ============================================================================
 
 from .lora import select_lora_modules
+from .utils import collect_lora_params_for_adapter
 
 __all__ = ["select_lora_modules", "collect_lora_params_for_adapter"]

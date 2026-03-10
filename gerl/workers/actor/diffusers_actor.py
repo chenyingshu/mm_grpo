@@ -88,7 +88,7 @@ class DiffusersPPOActor(BasePPOActor):
             self.scaler = None
 
     def _predict_micro_batch(
-            self, micro_batch: dict[str, torch.Tensor], step: int
+        self, micro_batch: dict[str, torch.Tensor], step: int
     ) -> torch.Tensor:
         """
         Returns:
